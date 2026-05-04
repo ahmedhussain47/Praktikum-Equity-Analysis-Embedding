@@ -13,6 +13,20 @@ venv/
 _tmp*.txt
 _ids*.txt
 
+# Signal generation — private, not for sharing
+src/signal_engine.py
+src/signal_generation.py
+src/signal_logger.py
+src/gold_intraday_predict.py
+src/risk_manager.py
+src/backtester.py
+src/data_feeds.py
+src/feature_engineering.py
+notebooks/05_signal_engine.ipynb
+app.py
+results/new_models/signals/
+trading_config.json
+
 # Generated outputs
 notebooks/lightning_logs/
 results/new_models/plots/*.png
