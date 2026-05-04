@@ -189,6 +189,101 @@ def run_naive_baseline(panel: pd.DataFrame, config: BenchmarkConfig) -> pd.DataF
     return pd.DataFrame(rows)
 
 
+# ── Classical statistical models ───────────────────────────────────────────────
+# Uses statsforecast 1.7.4 (C implementation — ms per series, no numba needed).
+# Install: pip install "statsforecast==1.7.4"
+
+def run_classical_models(
+    panel: pd.DataFrame,
+    config: BenchmarkConfig,
+    models_to_run: tuple[str, ...] = ("AutoARIMA", "AutoETS", "AutoTheta"),
+) -> pd.DataFrame:
+    """Walk-forward evaluation of classical statistical forecasting models.
+
+    Uses statsforecast 1.7.4 (Nixtla) — C-optimised implementations,
+    no numba/llvmlite dependency, parallelised across all CPU cores.
+
+      - AutoARIMA  : automatic ARIMA order selection (AIC-based)
+      - AutoETS    : automatic Exponential Smoothing / Holt-Winters
+      - AutoTheta  : Theta decomposition method
+
+    Returns the same column schema as all other model runners.
+    """
+    try:
+        from statsforecast import StatsForecast
+        from statsforecast.models import AutoARIMA, AutoETS, AutoTheta
+    except ImportError as exc:
+        raise ImportError(
+            'statsforecast 1.7.4 required. '
+            'Run: pip install "statsforecast==1.7.4"'
+        ) from exc
+
+    _registry = {
+        "AutoARIMA": AutoARIMA(season_length=5, approximation=True, max_p=1, max_q=1, max_d=1),
+        "AutoETS":   AutoETS(season_length=5),
+        "AutoTheta": AutoTheta(season_length=5),
+    }
+    unknown = [m for m in models_to_run if m not in _registry]
+    if unknown:
+        raise ValueError(f"Unknown models: {unknown}. Choose from {sorted(_registry)}")
+
+    model_objects = [_registry[m] for m in models_to_run]
+    sf_df = to_neuralforecast_df(panel)   # unique_id / ds / y — same format
+    all_predictions: list = []
+
+    max_horizon = max(config.horizons)
+    cutoff_dates = make_cutoff_dates(
+        panel, config.input_size, max_horizon, config.test_step, config.max_test_dates
+    )
+    print(f"Classical models: {len(cutoff_dates)} cutoffs  horizons={config.horizons}  models={list(models_to_run)}")
+
+    for cutoff_date in cutoff_dates:
+        train_df = sf_df[sf_df["ds"] <= cutoff_date].copy()
+        # Use only last INPUT_SIZE rows per ticker — speeds up classical models significantly
+        train_df = (train_df.sort_values("ds")
+                    .groupby("unique_id", group_keys=False)
+                    .tail(config.input_size))
+
+        sf = StatsForecast(
+            models=model_objects,
+            freq=config.freq,
+            n_jobs=-1,
+        )
+        fcst = sf.forecast(df=train_df, h=max_horizon).reset_index()
+        fcst = fcst.sort_values(["unique_id", "ds"])
+        fcst["step"] = fcst.groupby("unique_id").cumcount() + 1
+        print(f"  cutoff={cutoff_date.date()}  rows={len(fcst[fcst['step']==1])}")
+
+        for horizon in config.horizons:
+            fcst_h = fcst[fcst["step"] == horizon].copy()
+            for _, row in fcst_h.iterrows():
+                ticker = row["unique_id"]
+                actual = _actual_close_at(panel, ticker, cutoff_date, horizon)
+                if actual is None:
+                    continue
+                target_date, last_close, actual_close = actual
+                for model_name in models_to_run:
+                    if model_name not in fcst_h.columns:
+                        continue
+                    pred_close = float(row[model_name])
+                    if not np.isfinite(pred_close) or pred_close <= 0:
+                        continue
+                    all_predictions.append({
+                        "Date":         target_date,
+                        "Ticker":       ticker,
+                        "Model":        model_name,
+                        "Horizon":      horizon,
+                        "y_true":       actual_close / last_close - 1.0,
+                        "y_pred":       pred_close   / last_close - 1.0,
+                        "cutoff_date":  cutoff_date,
+                        "last_close":   last_close,
+                        "pred_close":   pred_close,
+                        "actual_close": actual_close,
+                    })
+
+    return pd.DataFrame(all_predictions)
+
+
 class ChronosZeroShotForecaster:
     def __init__(self, model_id: str = "amazon/chronos-bolt-tiny", device: str | None = None):
         import torch

@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# Models whose predictions are always constant (e.g. always 0).
+# Their cross-sectional ranking is arbitrary so IC/RankIC/Sharpe are excluded.
+_CONSTANT_PRED_MODELS = {"Naive-RandomWalk"}
+
+# Rebalancing frequency: 18 cutoffs over ~18 months ≈ 12 obs/year → annualise by √12
+_SHARPE_ANNUAL_FACTOR = 12
+
+# Long-short portfolio: top/bottom 20% of the ~160-asset universe
+_LS_TOP_N    = 32
+_LS_BOTTOM_N = 32
 
 
 def directional_accuracy(y_true, y_pred) -> float:
@@ -41,114 +52,147 @@ def summarize_predictions(predictions):
     return pd.DataFrame(rows).sort_values(["Horizon", "MAE", "Model"]).reset_index(drop=True)
 
 
-def cross_sectional_rank_ic(predictions: pd.DataFrame, min_assets: int = 5) -> pd.DataFrame:
-    rows = []
-    required = ["Date", "Ticker", "Model", "Horizon", "y_true", "y_pred"]
-    missing = [c for c in required if c not in predictions.columns]
-    if missing:
-        raise ValueError(f"Missing columns for RankIC: {missing}")
+def _normalize_cutoff(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Normalize cutoff_date to YYYY-MM-DD string to fix mixed-format duplicates."""
+    predictions = predictions.copy()
+    if "cutoff_date" in predictions.columns:
+        predictions["cutoff_date"] = (
+            pd.to_datetime(predictions["cutoff_date"], format="mixed")
+            .dt.strftime("%Y-%m-%d")
+        )
+    return predictions
 
-    for (model, horizon, date), g in predictions.groupby(["Model", "Horizon", "Date"]):
-        g = g.dropna(subset=["y_true", "y_pred"])
-        if g["Ticker"].nunique() < min_assets:
+
+def cross_sectional_ic(predictions: pd.DataFrame, min_assets: int = 20) -> pd.DataFrame:
+    """
+    Compute per-cutoff Pearson IC and Spearman RankIC for each (model, horizon).
+    Groups by cutoff_date (not Date) to get one cross-section per rebalancing period.
+    Excludes models with constant predictions (e.g. Naive-RandomWalk).
+    """
+    predictions = _normalize_cutoff(predictions)
+    group_col = "cutoff_date" if "cutoff_date" in predictions.columns else "Date"
+    rows = []
+
+    for (model, horizon), mg in predictions.groupby(["Model", "Horizon"]):
+        if model in _CONSTANT_PRED_MODELS:
             continue
-        if g["y_true"].nunique() < 2 or g["y_pred"].nunique() < 2:
-            continue
-        ic, _ = spearmanr(g["y_pred"], g["y_true"])
-        if np.isfinite(ic):
-            rows.append({
-                "Model": model,
-                "Horizon": horizon,
-                "Date": date,
-                "RankIC": float(ic),
-                "N_Assets": int(g["Ticker"].nunique()),
-            })
+        for cutoff, g in mg.groupby(group_col):
+            g = g.dropna(subset=["y_true", "y_pred"])
+            if g["Ticker"].nunique() < min_assets:
+                continue
+            if g["y_pred"].nunique() < 2:   # constant predictions at this cutoff
+                continue
+            try:
+                ic,     _ = pearsonr(g["y_pred"], g["y_true"])
+                rank_ic, _ = spearmanr(g["y_pred"], g["y_true"])
+            except Exception:
+                continue
+            if np.isfinite(ic) and np.isfinite(rank_ic):
+                rows.append({
+                    "Model": model, "Horizon": horizon, "Cutoff": cutoff,
+                    "IC": float(ic), "RankIC": float(rank_ic),
+                    "N_Assets": int(g["Ticker"].nunique()),
+                })
     return pd.DataFrame(rows)
 
 
-def summarize_rank_ic(rank_ic_df: pd.DataFrame) -> pd.DataFrame:
-    if rank_ic_df.empty:
-        return pd.DataFrame(columns=["Model", "Horizon", "RankIC_Mean", "RankIC_Std", "RankIC_IR", "N_Dates"])
+def summarize_ic(ic_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarise per-cutoff IC/RankIC into mean IC, mean RankIC, and IR.
+    IR = mean(IC) / std(IC)  — measures signal consistency across time.
+    """
+    if ic_df.empty:
+        return pd.DataFrame(columns=["Model", "Horizon", "IC", "RankIC", "IR", "N_Cutoffs"])
     rows = []
-    for (model, horizon), g in rank_ic_df.groupby(["Model", "Horizon"]):
-        mean = g["RankIC"].mean()
-        std = g["RankIC"].std(ddof=1)
+    for (model, horizon), g in ic_df.groupby(["Model", "Horizon"]):
+        mean_ic  = g["IC"].mean()
+        std_ic   = g["IC"].std(ddof=1)
+        mean_ric = g["RankIC"].mean()
         rows.append({
-            "Model": model,
-            "Horizon": horizon,
-            "RankIC_Mean": mean,
-            "RankIC_Std": std,
-            "RankIC_IR": mean / std if std and np.isfinite(std) else np.nan,
-            "N_Dates": len(g),
+            "Model":     model,
+            "Horizon":   horizon,
+            "IC":        round(mean_ic,  4),
+            "RankIC":    round(mean_ric, 4),
+            "IR":        round(mean_ic / std_ic, 4) if std_ic > 0 else np.nan,
+            "N_Cutoffs": len(g),
         })
-    return pd.DataFrame(rows).sort_values(["Horizon", "RankIC_Mean"], ascending=[True, False]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["Horizon", "IC"], ascending=[True, False]).reset_index(drop=True)
+
+
+# Keep old name as alias so existing notebook calls still work
+def cross_sectional_rank_ic(predictions: pd.DataFrame, min_assets: int = 20) -> pd.DataFrame:
+    return cross_sectional_ic(predictions, min_assets)
+
+
+def summarize_rank_ic(rank_ic_df: pd.DataFrame) -> pd.DataFrame:
+    return summarize_ic(rank_ic_df)
+
+
 def long_short_portfolio_summary(
     predictions: pd.DataFrame,
-    top_n: int = 2,
-    bottom_n: int = 2,
+    top_n: int = _LS_TOP_N,
+    bottom_n: int = _LS_BOTTOM_N,
 ) -> pd.DataFrame:
     """
-    Simple cross-sectional long-short portfolio test.
+    Cross-sectional long-short portfolio back-test.
 
-    For each model, horizon, and date:
-    - rank assets by predicted return
-    - long top_n assets
-    - short bottom_n assets
-    - portfolio return = average true return of longs - average true return of shorts
+    For each (model, horizon, cutoff_date):
+      - Rank all assets by y_pred (descending).
+      - Long top_n assets (20% of ~160), short bottom_n assets.
+      - Portfolio return = mean(long y_true) − mean(short y_true).
+
+    Sharpe is annualised using sqrt(12) because the portfolio rebalances monthly
+    (one cutoff every 21 trading days ≈ 12 rebalances per year).
+
+    Models with constant predictions (Naive-RandomWalk) are excluded:
+    their all-zero predictions produce an arbitrary ranking that is not a
+    real signal and yields a spurious non-zero Sharpe.
     """
+    predictions = _normalize_cutoff(predictions)
+    group_col = "cutoff_date" if "cutoff_date" in predictions.columns else "Date"
+
     rows = []
-
-    required = ["Date", "Ticker", "Model", "Horizon", "y_true", "y_pred"]
-    missing = [c for c in required if c not in predictions.columns]
-    if missing:
-        raise ValueError(f"Missing columns for portfolio summary: {missing}")
-
-    for (model, horizon, date), g in predictions.groupby(["Model", "Horizon", "Date"]):
-        g = g.dropna(subset=["y_true", "y_pred"]).copy()
-
-        if len(g) < top_n + bottom_n:
+    for (model, horizon), mg in predictions.groupby(["Model", "Horizon"]):
+        if model in _CONSTANT_PRED_MODELS:
             continue
+        for cutoff, g in mg.groupby(group_col):
+            g = g.dropna(subset=["y_true", "y_pred"]).copy()
+            if len(g) < top_n + bottom_n:
+                continue
+            if g["y_pred"].nunique() < 2:   # constant preds → arbitrary rank
+                continue
+            ranked     = g.sort_values("y_pred", ascending=False)
+            long_ret   = ranked.head(top_n)["y_true"].mean()
+            short_ret  = ranked.tail(bottom_n)["y_true"].mean()
+            rows.append({
+                "Model": model, "Horizon": horizon, "Cutoff": cutoff,
+                "LongReturn": long_ret, "ShortReturn": short_ret,
+                "LongShortReturn": long_ret - short_ret,
+                "N_Assets": g["Ticker"].nunique(),
+            })
 
-        g = g.sort_values("y_pred", ascending=False)
-
-        long_return = g.head(top_n)["y_true"].mean()
-        short_return = g.tail(bottom_n)["y_true"].mean()
-        portfolio_return = long_return - short_return
-
-        rows.append({
-            "Model": model,
-            "Horizon": horizon,
-            "Date": date,
-            "LongReturn": long_return,
-            "ShortReturn": short_return,
-            "LongShortReturn": portfolio_return,
-            "N_Assets": g["Ticker"].nunique(),
-        })
-
-    daily = pd.DataFrame(rows)
-
-    if daily.empty:
+    per_cutoff = pd.DataFrame(rows)
+    if per_cutoff.empty:
         return pd.DataFrame(columns=[
-            "Model", "Horizon", "MeanLongShortReturn",
-            "VolLongShortReturn", "SharpeApprox", "N_Dates"
+            "Model", "Horizon", "MeanLSReturn", "VolLSReturn", "Sharpe", "N_Cutoffs"
         ])
 
     summary_rows = []
-
-    for (model, horizon), g in daily.groupby(["Model", "Horizon"]):
-        mean_ret = g["LongShortReturn"].mean()
-        vol_ret = g["LongShortReturn"].std(ddof=1)
-
+    for (model, horizon), g in per_cutoff.groupby(["Model", "Horizon"]):
+        pr       = g["LongShortReturn"].values
+        mean_ret = pr.mean()
+        vol_ret  = pr.std(ddof=1)
+        sharpe   = (mean_ret / vol_ret * np.sqrt(_SHARPE_ANNUAL_FACTOR)
+                    if vol_ret > 0 and np.isfinite(vol_ret) else np.nan)
         summary_rows.append({
-            "Model": model,
-            "Horizon": horizon,
-            "MeanLongShortReturn": mean_ret,
-            "VolLongShortReturn": vol_ret,
-            "SharpeApprox": mean_ret / vol_ret if vol_ret and np.isfinite(vol_ret) else np.nan,
-            "N_Dates": len(g),
+            "Model":       model,
+            "Horizon":     horizon,
+            "MeanLSReturn": round(mean_ret, 6),
+            "VolLSReturn":  round(vol_ret,  6),
+            "Sharpe":       round(sharpe, 4) if np.isfinite(sharpe) else np.nan,
+            "N_Cutoffs":    len(g),
         })
 
     return pd.DataFrame(summary_rows).sort_values(
-        ["Horizon", "SharpeApprox"],
-        ascending=[True, False],
+        ["Horizon", "Sharpe"], ascending=[True, False]
     ).reset_index(drop=True)
