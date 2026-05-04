@@ -176,6 +176,7 @@ with st.sidebar:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 st.title("Gold (XAUUSD) Trade Planner")
+st.markdown("**Developed by Ahmed R. Hussain** &nbsp;|&nbsp; *Beta Version — Not 100% Functional. Use for research purposes only.*")
 st.caption(
     f"AutoTheta + AutoETS Ensemble  |  Live via yfinance  |  "
     f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
